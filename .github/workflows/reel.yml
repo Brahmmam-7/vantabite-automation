@@ -44,7 +44,9 @@ jobs:
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/image",
               headers={
-                  "Authorization": "Bearer " + secret
+                  "Authorization": "Bearer " + secret,
+                  "User-Agent": "VantaBite-Automation/1.0",
+                  "Accept": "image/jpeg"
               }
           )
 
@@ -63,7 +65,6 @@ jobs:
               details = error.read().decode("utf-8", errors="replace")
               details = details.replace(secret, "[hidden]")
               print("HTTP status:", error.code)
-              print("Content type:", error.headers.get("Content-Type", ""))
               print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
               print("Response:", details[:3000])
               raise SystemExit(1)
@@ -111,7 +112,9 @@ jobs:
               method="POST",
               headers={
                   "Authorization": "Bearer " + secret,
-                  "Content-Type": "video/mp4"
+                  "User-Agent": "VantaBite-Automation/1.0",
+                  "Content-Type": "video/mp4",
+                  "Accept": "application/json"
               }
           )
 
@@ -129,7 +132,6 @@ jobs:
               details = error.read().decode("utf-8", errors="replace")
               details = details.replace(secret, "[hidden]")
               print("HTTP status:", error.code)
-              print("Content type:", error.headers.get("Content-Type", ""))
               print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
               print("Response:", details[:3000])
               raise SystemExit(1)
