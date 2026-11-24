@@ -1,0 +1,98 @@
+name: VantaBite Reel Preparation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vantabite-reel
+  cancel-in-progress: false
+
+jobs:
+  prepare-reel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      WORKER_URL: https://vantabite-automation.brahmi-co-517.workers.dev
+      ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+
+    steps:
+      - name: Check secret
+        run: |
+          if [ -z "$ADMIN_KEY" ]; then
+            echo "ADMIN_KEY repository secret is missing."
+            exit 1
+          fi
+
+      - name: Install video tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Download food image
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.request
+
+          request = urllib.request.Request(
+              os.environ["WORKER_URL"] + "/automation/image",
+              headers={
+                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"]
+              }
+          )
+
+          with urllib.request.urlopen(request, timeout=120) as response:
+              if not response.headers.get("Content-Type", "").startswith("image/"):
+                  raise RuntimeError("Worker did not return an image.")
+              with open("food.jpg", "wb") as output:
+                  output.write(response.read())
+
+          print("Food image downloaded.")
+          PY
+
+      - name: Create vertical video
+        run: |
+          ffmpeg -hide_banner -loglevel error -y \
+            -loop 1 -i food.jpg \
+            -t 12 \
+            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
+            -r 30 \
+            -c:v libx264 \
+            -preset fast \
+            -crf 23 \
+            -pix_fmt yuv420p \
+            -movflags +faststart \
+            -an \
+            reel.mp4
+
+      - name: Upload video to Worker
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.request
+
+          with open("reel.mp4", "rb") as source:
+              video = source.read()
+
+          if len(video) > 20 * 1024 * 1024:
+              raise RuntimeError("Video exceeds our 20 MB upload limit.")
+
+          request = urllib.request.Request(
+              os.environ["WORKER_URL"] + "/automation/video",
+              data=video,
+              method="POST",
+              headers={
+                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
+                  "Content-Type": "video/mp4"
+              }
+          )
+
+          with urllib.request.urlopen(request, timeout=120) as response:
+              print(response.read().decode())
+
+          print("Video preparation complete.")
+          PY
