@@ -49,22 +49,20 @@ jobs:
 
           try:
               with urllib.request.urlopen(request, timeout=120) as response:
-                  content_type = response.headers.get("Content-Type", "")
-
-                  if not content_type.startswith("image/"):
-                      raise SystemExit("Worker did not return an image.")
+                  if not response.headers.get(
+                      "Content-Type", ""
+                  ).startswith("image/"):
+                      raise ValueError("Expected an image.")
 
                   with open("food.jpg", "wb") as output:
                       output.write(response.read())
           except Exception:
               raise SystemExit(
-                  "Image download failed. Check the Worker and ADMIN_KEY."
+                  "Image download failed. Check Worker and ADMIN_KEY."
               )
-
-          print("Food image downloaded.")
           PY
 
-      - name: Automatically select and download music
+      - name: Automatically select music
         run: |
           python3 - <<'PY'
           import json
@@ -73,14 +71,8 @@ jobs:
           import urllib.request
 
           tracks = [
-              {
-                  "title": "Carefree",
-                  "isrc": "USUAN1400037"
-              },
-              {
-                  "title": "Life of Riley",
-                  "isrc": "USUAN1400054"
-              }
+              {"title": "Carefree", "isrc": "USUAN1400037"},
+              {"title": "Life of Riley", "isrc": "USUAN1400054"}
           ]
 
           random.SystemRandom().shuffle(tracks)
@@ -98,107 +90,67 @@ jobs:
               )
 
               try:
-                  with urllib.request.urlopen(request, timeout=120) as response:
+                  with urllib.request.urlopen(
+                      request, timeout=120
+                  ) as response:
                       audio = response.read()
 
-                  if len(audio) < 10000 or audio.lstrip().startswith(b"<"):
-                      raise ValueError("Unexpected audio download.")
+                  if (
+                      len(audio) < 10000 or
+                      audio.lstrip().startswith(b"<")
+                  ):
+                      raise ValueError("Invalid music download.")
 
                   with open("music.mp3", "wb") as output:
                       output.write(audio)
 
-                  track["artist"] = "Kevin MacLeod"
-                  track["source"] = (
-                      "https://incompetech.com/music/"
-                      "royalty-free/index.html?isrc=" + track["isrc"]
-                  )
-                  track["license"] = "CC BY 4.0"
-                  track["license_url"] = (
-                      "https://creativecommons.org/licenses/by/4.0/"
-                  )
-                  track["changes"] = (
-                      "12-second excerpt, volume adjusted, faded in and out."
-                  )
-                  track["credit"] = (
-                      f'Music: "{track["title"]}" by Kevin MacLeod '
-                      f'(incompetech.com). CC BY 4.0: '
-                      f'{track["license_url"]} '
-                      f'Source: {track["source"]}. '
-                      f'Changes: {track["changes"]}'
-                  )
-
                   with open("music-credit.json", "w") as output:
-                      json.dump(track, output, indent=2)
+                      json.dump(track, output)
 
-                  print("Selected music:", track["title"])
+                  print("Selected:", track["title"])
                   break
-
               except Exception:
-                  print("Download failed for:", track["title"])
-
+                  print("Download failed:", track["title"])
           else:
-              raise SystemExit(
-                  "No music could be downloaded. Nothing uploaded."
-              )
+              raise SystemExit("Music download failed.")
           PY
 
-      - name: Validate downloaded audio
+      - name: Validate music
         run: |
           ffmpeg -hide_banner -loglevel error -xerror \
             -i music.mp3 -t 12 -f null -
 
-      - name: Create vertical Reel with music
+      - name: Create Reel with music
         run: |
           ffmpeg -hide_banner -loglevel error -y \
             -loop 1 -framerate 30 -i food.jpg \
             -i music.mp3 \
             -filter_complex \
             "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,boxblur=40:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v];[1:a]atrim=duration=12,asetpts=PTS-STARTPTS,volume=0.65,afade=t=in:st=0:d=0.5,afade=t=out:st=10.5:d=1.5[a]" \
-            -map "[v]" \
-            -map "[a]" \
-            -t 12 \
-            -r 30 \
-            -c:v libx264 \
-            -preset fast \
-            -crf 23 \
+            -map "[v]" -map "[a]" \
+            -t 12 -r 30 \
+            -c:v libx264 -preset fast -crf 23 \
             -pix_fmt yuv420p \
-            -c:a aac \
-            -b:a 128k \
-            -ar 48000 \
-            -ac 2 \
+            -c:a aac -b:a 128k -ar 48000 -ac 2 \
             -movflags +faststart \
             reel.mp4
 
-      - name: Save music credit in workflow summary
+      - name: Upload Reel and music details
         run: |
           python3 - <<'PY'
           import json
           import os
+          import urllib.request
+          import urllib.error
 
           with open("music-credit.json") as source:
               track = json.load(source)
-
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write("## Selected audio\n\n")
-              summary.write(track["credit"] + "\n\n")
-              summary.write(
-                  "Include this credit in the publishing caption.\n"
-              )
-          PY
-
-      - name: Upload video to Worker
-        run: |
-          python3 - <<'PY'
-          import os
-          import json
-          import urllib.request
-          import urllib.error
 
           with open("reel.mp4", "rb") as source:
               video = source.read()
 
           if len(video) > 20 * 1024 * 1024:
-              raise SystemExit("Video exceeds the 20 MB upload limit.")
+              raise SystemExit("Video exceeds 20 MB.")
 
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/video",
@@ -206,27 +158,36 @@ jobs:
               method="POST",
               headers={
                   "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
-                  "User-Agent": "VantaBite-Automation/1.0",
                   "Content-Type": "video/mp4",
-                  "Accept": "application/json"
+                  "Accept": "application/json",
+                  "User-Agent": "VantaBite-Automation/1.0",
+                  "X-Music-Title": track["title"]
               }
           )
 
           try:
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  result = json.loads(response.read().decode())
+              with urllib.request.urlopen(
+                  request, timeout=120
+              ) as response:
+                  result = json.loads(response.read())
 
               if result.get("ok") is not True:
-                  raise SystemExit("Worker did not confirm the upload.")
+                  raise SystemExit("Worker did not confirm upload.")
 
           except urllib.error.HTTPError as error:
               raise SystemExit(
-                  "Video upload failed. HTTP status: " + str(error.code)
+                  "Upload failed. HTTP " + str(error.code)
+              )
+          except urllib.error.URLError:
+              raise SystemExit("Could not connect to Worker.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "Reel uploaded with music: " + track["title"] +
+                  "\n\nCaption and music credit saved by Worker."
+                  "\n\nNothing published to Instagram.\n"
               )
 
-          except urllib.error.URLError:
-              raise SystemExit("Could not connect to the Worker.")
-
-          print("Reel with music uploaded successfully.")
+          print("Video and music details uploaded.")
           print("Nothing published to Instagram.")
           PY
