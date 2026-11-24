@@ -37,14 +37,11 @@ jobs:
           python3 - <<'PY'
           import os
           import urllib.request
-          import urllib.error
-
-          secret = os.environ["ADMIN_KEY"]
 
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/image",
               headers={
-                  "Authorization": "Bearer " + secret,
+                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
                   "User-Agent": "VantaBite-Automation/1.0",
                   "Accept": "image/jpeg"
               }
@@ -55,42 +52,139 @@ jobs:
                   content_type = response.headers.get("Content-Type", "")
 
                   if not content_type.startswith("image/"):
-                      print("Unexpected content type:", content_type)
                       raise SystemExit("Worker did not return an image.")
 
                   with open("food.jpg", "wb") as output:
                       output.write(response.read())
-
-          except urllib.error.HTTPError as error:
-              details = error.read().decode("utf-8", errors="replace")
-              details = details.replace(secret, "[hidden]")
-              print("HTTP status:", error.code)
-              print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
-              print("Response:", details[:3000])
-              raise SystemExit(1)
-
-          except urllib.error.URLError:
-              raise SystemExit("Could not connect to the Worker.")
+          except Exception:
+              raise SystemExit(
+                  "Image download failed. Check the Worker and ADMIN_KEY."
+              )
 
           print("Food image downloaded.")
           PY
 
-      - name: Create vertical video with blurred background
+      - name: Automatically select and download music
+        run: |
+          python3 - <<'PY'
+          import json
+          import random
+          import urllib.parse
+          import urllib.request
+
+          tracks = [
+              {
+                  "title": "Carefree",
+                  "isrc": "USUAN1400037"
+              },
+              {
+                  "title": "Life of Riley",
+                  "isrc": "USUAN1400054"
+              }
+          ]
+
+          random.SystemRandom().shuffle(tracks)
+
+          for track in tracks:
+              filename = urllib.parse.quote(track["title"]) + ".mp3"
+              audio_url = (
+                  "https://incompetech.com/music/"
+                  "royalty-free/mp3-royaltyfree/" + filename
+              )
+
+              request = urllib.request.Request(
+                  audio_url,
+                  headers={"User-Agent": "VantaBite-Automation/1.0"}
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      audio = response.read()
+
+                  if len(audio) < 10000 or audio.lstrip().startswith(b"<"):
+                      raise ValueError("Unexpected audio download.")
+
+                  with open("music.mp3", "wb") as output:
+                      output.write(audio)
+
+                  track["artist"] = "Kevin MacLeod"
+                  track["source"] = (
+                      "https://incompetech.com/music/"
+                      "royalty-free/index.html?isrc=" + track["isrc"]
+                  )
+                  track["license"] = "CC BY 4.0"
+                  track["license_url"] = (
+                      "https://creativecommons.org/licenses/by/4.0/"
+                  )
+                  track["changes"] = (
+                      "12-second excerpt, volume adjusted, faded in and out."
+                  )
+                  track["credit"] = (
+                      f'Music: "{track["title"]}" by Kevin MacLeod '
+                      f'(incompetech.com). CC BY 4.0: '
+                      f'{track["license_url"]} '
+                      f'Source: {track["source"]}. '
+                      f'Changes: {track["changes"]}'
+                  )
+
+                  with open("music-credit.json", "w") as output:
+                      json.dump(track, output, indent=2)
+
+                  print("Selected music:", track["title"])
+                  break
+
+              except Exception:
+                  print("Download failed for:", track["title"])
+
+          else:
+              raise SystemExit(
+                  "No music could be downloaded. Nothing uploaded."
+              )
+          PY
+
+      - name: Validate downloaded audio
+        run: |
+          ffmpeg -hide_banner -loglevel error -xerror \
+            -i music.mp3 -t 12 -f null -
+
+      - name: Create vertical Reel with music
         run: |
           ffmpeg -hide_banner -loglevel error -y \
             -loop 1 -framerate 30 -i food.jpg \
+            -i music.mp3 \
             -filter_complex \
-            "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,boxblur=40:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]" \
+            "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,boxblur=40:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v];[1:a]atrim=duration=12,asetpts=PTS-STARTPTS,volume=0.65,afade=t=in:st=0:d=0.5,afade=t=out:st=10.5:d=1.5[a]" \
             -map "[v]" \
+            -map "[a]" \
             -t 12 \
             -r 30 \
             -c:v libx264 \
             -preset fast \
             -crf 23 \
             -pix_fmt yuv420p \
+            -c:a aac \
+            -b:a 128k \
+            -ar 48000 \
+            -ac 2 \
             -movflags +faststart \
-            -an \
             reel.mp4
+
+      - name: Save music credit in workflow summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open("music-credit.json") as source:
+              track = json.load(source)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## Selected audio\n\n")
+              summary.write(track["credit"] + "\n\n")
+              summary.write(
+                  "Include this credit in the publishing caption.\n"
+              )
+          PY
 
       - name: Upload video to Worker
         run: |
@@ -100,20 +194,18 @@ jobs:
           import urllib.request
           import urllib.error
 
-          secret = os.environ["ADMIN_KEY"]
-
           with open("reel.mp4", "rb") as source:
               video = source.read()
 
           if len(video) > 20 * 1024 * 1024:
-              raise SystemExit("Video exceeds our 20 MB upload limit.")
+              raise SystemExit("Video exceeds the 20 MB upload limit.")
 
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/video",
               data=video,
               method="POST",
               headers={
-                  "Authorization": "Bearer " + secret,
+                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
                   "User-Agent": "VantaBite-Automation/1.0",
                   "Content-Type": "video/mp4",
                   "Accept": "application/json"
@@ -124,22 +216,17 @@ jobs:
               with urllib.request.urlopen(request, timeout=120) as response:
                   result = json.loads(response.read().decode())
 
-                  if result.get("ok") is not True:
-                      raise SystemExit("Worker did not confirm the upload.")
-
-                  print("Video uploaded successfully.")
-                  print("Video size in bytes:", len(video))
+              if result.get("ok") is not True:
+                  raise SystemExit("Worker did not confirm the upload.")
 
           except urllib.error.HTTPError as error:
-              details = error.read().decode("utf-8", errors="replace")
-              details = details.replace(secret, "[hidden]")
-              print("HTTP status:", error.code)
-              print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
-              print("Response:", details[:3000])
-              raise SystemExit(1)
+              raise SystemExit(
+                  "Video upload failed. HTTP status: " + str(error.code)
+              )
 
           except urllib.error.URLError:
               raise SystemExit("Could not connect to the Worker.")
 
-          print("Video preparation complete. Nothing published to Instagram.")
+          print("Reel with music uploaded successfully.")
+          print("Nothing published to Instagram.")
           PY
