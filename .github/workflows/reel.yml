@@ -37,19 +37,39 @@ jobs:
           python3 - <<'PY'
           import os
           import urllib.request
+          import urllib.error
+
+          secret = os.environ["ADMIN_KEY"]
 
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/image",
               headers={
-                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"]
+                  "Authorization": "Bearer " + secret
               }
           )
 
-          with urllib.request.urlopen(request, timeout=120) as response:
-              if not response.headers.get("Content-Type", "").startswith("image/"):
-                  raise RuntimeError("Worker did not return an image.")
-              with open("food.jpg", "wb") as output:
-                  output.write(response.read())
+          try:
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  content_type = response.headers.get("Content-Type", "")
+
+                  if not content_type.startswith("image/"):
+                      print("Unexpected content type:", content_type)
+                      raise SystemExit("Worker did not return an image.")
+
+                  with open("food.jpg", "wb") as output:
+                      output.write(response.read())
+
+          except urllib.error.HTTPError as error:
+              details = error.read().decode("utf-8", errors="replace")
+              details = details.replace(secret, "[hidden]")
+              print("HTTP status:", error.code)
+              print("Content type:", error.headers.get("Content-Type", ""))
+              print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
+              print("Response:", details[:3000])
+              raise SystemExit(1)
+
+          except urllib.error.URLError:
+              raise SystemExit("Could not connect to the Worker.")
 
           print("Food image downloaded.")
           PY
@@ -73,26 +93,49 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import json
           import urllib.request
+          import urllib.error
+
+          secret = os.environ["ADMIN_KEY"]
 
           with open("reel.mp4", "rb") as source:
               video = source.read()
 
           if len(video) > 20 * 1024 * 1024:
-              raise RuntimeError("Video exceeds our 20 MB upload limit.")
+              raise SystemExit("Video exceeds our 20 MB upload limit.")
 
           request = urllib.request.Request(
               os.environ["WORKER_URL"] + "/automation/video",
               data=video,
               method="POST",
               headers={
-                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
+                  "Authorization": "Bearer " + secret,
                   "Content-Type": "video/mp4"
               }
           )
 
-          with urllib.request.urlopen(request, timeout=120) as response:
-              print(response.read().decode())
+          try:
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  result = json.loads(response.read().decode())
 
-          print("Video preparation complete.")
+                  if result.get("ok") is not True:
+                      raise SystemExit("Worker did not confirm the upload.")
+
+                  print("Video uploaded successfully.")
+                  print("Video size in bytes:", len(video))
+
+          except urllib.error.HTTPError as error:
+              details = error.read().decode("utf-8", errors="replace")
+              details = details.replace(secret, "[hidden]")
+              print("HTTP status:", error.code)
+              print("Content type:", error.headers.get("Content-Type", ""))
+              print("Cloudflare Ray:", error.headers.get("CF-Ray", ""))
+              print("Response:", details[:3000])
+              raise SystemExit(1)
+
+          except urllib.error.URLError:
+              raise SystemExit("Could not connect to the Worker.")
+
+          print("Video preparation complete. Nothing published to Instagram.")
           PY
