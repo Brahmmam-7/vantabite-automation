@@ -1,7 +1,16 @@
-name: VantaBite Reel Preparation
+name: VantaBite Daily Automation
 
 on:
+  schedule:
+    # 18:30 IST: prepare in advance, then wait until 19:00 IST.
+    - cron: "0 13 * * *"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish today's Reel after preparation"
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -11,13 +20,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare-reel:
+  daily-reel:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
 
     env:
       WORKER_URL: https://vantabite-automation.brahmi-co-517.workers.dev
       ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+      PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
 
     steps:
       - name: Check secret
@@ -32,162 +42,261 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
-      - name: Download food image
+      - name: Generate, prepare and publish daily Reel
         run: |
           python3 - <<'PY'
-          import os
-          import urllib.request
-
-          request = urllib.request.Request(
-              os.environ["WORKER_URL"] + "/automation/image",
-              headers={
-                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
-                  "User-Agent": "VantaBite-Automation/1.0",
-                  "Accept": "image/jpeg"
-              }
-          )
-
-          try:
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  if not response.headers.get(
-                      "Content-Type", ""
-                  ).startswith("image/"):
-                      raise ValueError("Expected an image.")
-
-                  with open("food.jpg", "wb") as output:
-                      output.write(response.read())
-          except Exception:
-              raise SystemExit(
-                  "Image download failed. Check Worker and ADMIN_KEY."
-              )
-          PY
-
-      - name: Automatically select music
-        run: |
-          python3 - <<'PY'
+          import datetime
           import json
+          import os
           import random
+          import subprocess
+          import time
+          import urllib.error
           import urllib.parse
           import urllib.request
 
-          tracks = [
-              {"title": "Carefree", "isrc": "USUAN1400037"},
-              {"title": "Life of Riley", "isrc": "USUAN1400054"}
-          ]
+          IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+          now = datetime.datetime.now(IST)
+          day = now.date().isoformat()
 
-          random.SystemRandom().shuffle(tracks)
+          base = os.environ["WORKER_URL"]
+          secret = os.environ["ADMIN_KEY"]
+          publish = os.environ.get("PUBLISH", "").lower() == "true"
+          scheduled = os.environ["GITHUB_EVENT_NAME"] == "schedule"
 
-          for track in tracks:
-              filename = urllib.parse.quote(track["title"]) + ".mp3"
-              audio_url = (
-                  "https://incompetech.com/music/"
-                  "royalty-free/mp3-royaltyfree/" + filename
-              )
+          # A severely delayed scheduled run should not publish overnight.
+          if scheduled and (now.hour < 18 or now.hour >= 22):
+              raise SystemExit("Outside today's publishing window.")
+
+          def call(route, method="GET", data=None, extra=None, binary=False):
+              address = base + route + "?day=" + day
+              headers = {
+                  "Authorization": "Bearer " + secret,
+                  "User-Agent": "VantaBite-Automation/2.0",
+                  "Accept": "application/json"
+              }
+              if extra:
+                  headers.update(extra)
 
               request = urllib.request.Request(
-                  audio_url,
-                  headers={"User-Agent": "VantaBite-Automation/1.0"}
+                  address,
+                  data=data,
+                  method=method,
+                  headers=headers
               )
 
               try:
                   with urllib.request.urlopen(
-                      request, timeout=120
+                      request, timeout=240
                   ) as response:
-                      audio = response.read()
+                      body = response.read()
 
-                  if (
-                      len(audio) < 10000 or
-                      audio.lstrip().startswith(b"<")
-                  ):
-                      raise ValueError("Invalid music download.")
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", errors="replace")
+                  detail = detail.replace(secret, "[hidden]")
+                  raise RuntimeError(
+                      f"{route}: HTTP {error.code}: {detail[:1500]}"
+                  )
 
-                  with open("music.mp3", "wb") as output:
-                      output.write(audio)
+              except urllib.error.URLError:
+                  raise RuntimeError(
+                      route + ": connection failed. Mutation not retried."
+                  )
 
-                  with open("music-credit.json", "w") as output:
-                      json.dump(track, output)
+              if binary:
+                  return body
 
-                  print("Selected:", track["title"])
+              result = json.loads(body)
+              if result.get("ok") is not True:
+                  raise RuntimeError(
+                      result.get("message", "Worker rejected request.")
+                  )
+              return result
+
+          def summary(text):
+              print(text)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                  output.write(text + "\n\n")
+
+          job = call("/daily/start", "POST", b"")["job"]
+
+          if job["state"] == "PUBLISHED" or job.get("published_id"):
+              summary("Today's Reel was already published. No duplicate sent.")
+              raise SystemExit(0)
+
+          if job["state"] == "NEW":
+              print("Generating today's food image:", job["dish"])
+              image = call(
+                  "/daily/image",
+                  "POST",
+                  b"",
+                  binary=True
+              )
+              with open("food.jpg", "wb") as output:
+                  output.write(image)
+
+              tracks = [
+                  {"title": "Carefree"},
+                  {"title": "Life of Riley"}
+              ]
+              random.SystemRandom().shuffle(tracks)
+
+              selected = None
+
+              for track in tracks:
+                  filename = urllib.parse.quote(track["title"]) + ".mp3"
+                  address = (
+                      "https://incompetech.com/music/"
+                      "royalty-free/mp3-royaltyfree/" + filename
+                  )
+                  try:
+                      request = urllib.request.Request(
+                          address,
+                          headers={"User-Agent": "VantaBite-Automation/2.0"}
+                      )
+                      with urllib.request.urlopen(
+                          request, timeout=120
+                      ) as response:
+                          music = response.read()
+
+                      if (
+                          len(music) < 10000 or
+                          music.lstrip().startswith(b"<")
+                      ):
+                          raise ValueError("Invalid audio download.")
+
+                      with open("music.mp3", "wb") as output:
+                          output.write(music)
+
+                      subprocess.run([
+                          "ffmpeg", "-hide_banner", "-loglevel", "error",
+                          "-xerror", "-i", "music.mp3",
+                          "-t", "12", "-f", "null", "-"
+                      ], check=True)
+
+                      selected = track
+                      break
+
+                  except Exception:
+                      print("Could not use:", track["title"])
+
+              if selected is None:
+                  raise RuntimeError("No music available. Nothing published.")
+
+              filters = (
+                  "[0:v]split=2[bg][fg];"
+                  "[bg]scale=1080:1920:"
+                  "force_original_aspect_ratio=increase,"
+                  "crop=1080:1920,setsar=1,boxblur=40:2[background];"
+                  "[fg]scale=1080:1920:"
+                  "force_original_aspect_ratio=decrease,"
+                  "setsar=1[foreground];"
+                  "[background][foreground]"
+                  "overlay=(W-w)/2:(H-h)/2,format=yuv420p[v];"
+                  "[1:a]atrim=duration=12,asetpts=PTS-STARTPTS,"
+                  "volume=0.65,afade=t=in:st=0:d=0.5,"
+                  "afade=t=out:st=10.5:d=1.5[a]"
+              )
+
+              subprocess.run([
+                  "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                  "-loop", "1", "-framerate", "30", "-i", "food.jpg",
+                  "-i", "music.mp3",
+                  "-filter_complex", filters,
+                  "-map", "[v]", "-map", "[a]",
+                  "-t", "12", "-r", "30",
+                  "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                  "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "128k",
+                  "-ar", "48000", "-ac", "2",
+                  "-movflags", "+faststart", "reel.mp4"
+              ], check=True)
+
+              with open("reel.mp4", "rb") as source:
+                  video = source.read()
+
+              if len(video) > 20 * 1024 * 1024:
+                  raise RuntimeError("Video exceeds 20 MB.")
+
+              job = call(
+                  "/daily/video",
+                  "POST",
+                  video,
+                  {
+                      "Content-Type": "video/mp4",
+                      "X-Music-Title": selected["title"]
+                  }
+              )["job"]
+
+              summary(
+                  "Prepared " + job["dish"] +
+                  ' with music "' + selected["title"] + '".'
+              )
+
+          if job["state"] == "VIDEO_READY":
+              # Give public media storage time to propagate before Meta fetches it.
+              time.sleep(65)
+              job = call("/daily/prepare", "POST", b"")["job"]
+
+          if not job.get("container_id"):
+              raise RuntimeError(
+                  "Preparation outcome needs inspection. "
+                  "No automatic repeat or publish attempted."
+              )
+
+          status = None
+          for attempt in range(30):
+              result = call("/daily/status")
+              status = result["status"]
+              print("Instagram processing:", status)
+
+              if status == "PUBLISHED":
+                  summary("Instagram reports today's Reel is already published.")
+                  raise SystemExit(0)
+
+              if status == "FINISHED":
                   break
-              except Exception:
-                  print("Download failed:", track["title"])
+
+              if status in ("ERROR", "EXPIRED"):
+                  raise RuntimeError(
+                      "Instagram processing failed: " +
+                      result.get("details", status)
+                  )
+
+              time.sleep(20)
           else:
-              raise SystemExit("Music download failed.")
-          PY
+              raise RuntimeError(
+                  "Instagram processing did not finish within 10 minutes."
+              )
 
-      - name: Validate music
-        run: |
-          ffmpeg -hide_banner -loglevel error -xerror \
-            -i music.mp3 -t 12 -f null -
+          if not publish:
+              summary(
+                  "Preview ready. Publishing was disabled for this manual run. "
+                  "Scheduled runs publish automatically."
+              )
+              raise SystemExit(0)
 
-      - name: Create Reel with music
-        run: |
-          ffmpeg -hide_banner -loglevel error -y \
-            -loop 1 -framerate 30 -i food.jpg \
-            -i music.mp3 \
-            -filter_complex \
-            "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,boxblur=40:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v];[1:a]atrim=duration=12,asetpts=PTS-STARTPTS,volume=0.65,afade=t=in:st=0:d=0.5,afade=t=out:st=10.5:d=1.5[a]" \
-            -map "[v]" -map "[a]" \
-            -t 12 -r 30 \
-            -c:v libx264 -preset fast -crf 23 \
-            -pix_fmt yuv420p \
-            -c:a aac -b:a 128k -ar 48000 -ac 2 \
-            -movflags +faststart \
-            reel.mp4
-
-      - name: Upload Reel and music details
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import urllib.request
-          import urllib.error
-
-          with open("music-credit.json") as source:
-              track = json.load(source)
-
-          with open("reel.mp4", "rb") as source:
-              video = source.read()
-
-          if len(video) > 20 * 1024 * 1024:
-              raise SystemExit("Video exceeds 20 MB.")
-
-          request = urllib.request.Request(
-              os.environ["WORKER_URL"] + "/automation/video",
-              data=video,
-              method="POST",
-              headers={
-                  "Authorization": "Bearer " + os.environ["ADMIN_KEY"],
-                  "Content-Type": "video/mp4",
-                  "Accept": "application/json",
-                  "User-Agent": "VantaBite-Automation/1.0",
-                  "X-Music-Title": track["title"]
-              }
+          target = datetime.datetime.combine(
+              datetime.date.fromisoformat(day),
+              datetime.time(19, 0),
+              tzinfo=IST
           )
 
-          try:
-              with urllib.request.urlopen(
-                  request, timeout=120
-              ) as response:
-                  result = json.loads(response.read())
+          while datetime.datetime.now(IST) < target:
+              remaining = (
+                  target - datetime.datetime.now(IST)
+              ).total_seconds()
+              time.sleep(min(30, max(0, remaining)))
 
-              if result.get("ok") is not True:
-                  raise SystemExit("Worker did not confirm upload.")
+          current = datetime.datetime.now(IST)
 
-          except urllib.error.HTTPError as error:
-              raise SystemExit(
-                  "Upload failed. HTTP " + str(error.code)
-              )
-          except urllib.error.URLError:
-              raise SystemExit("Could not connect to Worker.")
+          if current.date().isoformat() != day or current.hour >= 22:
+              raise RuntimeError("Publishing window ended. Nothing published.")
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write(
-                  "Reel uploaded with music: " + track["title"] +
-                  "\n\nCaption and music credit saved by Worker."
-                  "\n\nNothing published to Instagram.\n"
-              )
+          result = call("/daily/publish", "POST", b"")
 
-          print("Video and music details uploaded.")
-          print("Nothing published to Instagram.")
+          summary(
+              "Today's Reel published or confirmed already published. "
+              "Media ID: " + str(result.get("publishedId", "see Instagram"))
+          )
           PY
