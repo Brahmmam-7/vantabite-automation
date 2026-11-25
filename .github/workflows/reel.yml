@@ -2,12 +2,12 @@ name: VantaBite Daily Automation
 
 on:
   schedule:
-    # 18:30 IST: prepare in advance, then wait until 19:00 IST.
+    # Start preparing at 18:30 IST.
     - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish today's Reel after preparation"
+        description: "Publish today's Reel at or after 7 PM IST"
         type: boolean
         required: true
         default: false
@@ -52,7 +52,6 @@ jobs:
           import subprocess
           import time
           import urllib.error
-          import urllib.parse
           import urllib.request
 
           IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -64,22 +63,29 @@ jobs:
           publish = os.environ.get("PUBLISH", "").lower() == "true"
           scheduled = os.environ["GITHUB_EVENT_NAME"] == "schedule"
 
-          # A severely delayed scheduled run should not publish overnight.
+          # Manual publishing also waits for 7 PM.
+          # Run a preview test in the morning with Publish unchecked.
+          if publish and not scheduled and now.hour < 18:
+              raise SystemExit(
+                  "Run a preview with Publish unchecked now. "
+                  "The scheduled run publishes this evening."
+              )
+
           if scheduled and (now.hour < 18 or now.hour >= 22):
               raise SystemExit("Outside today's publishing window.")
 
           def call(route, method="GET", data=None, extra=None, binary=False):
-              address = base + route + "?day=" + day
               headers = {
                   "Authorization": "Bearer " + secret,
-                  "User-Agent": "VantaBite-Automation/2.0",
+                  "User-Agent": "VantaBite-Automation/3.0",
                   "Accept": "application/json"
               }
+
               if extra:
                   headers.update(extra)
 
               request = urllib.request.Request(
-                  address,
+                  base + route + "?day=" + day,
                   data=data,
                   method=method,
                   headers=headers
@@ -107,10 +113,12 @@ jobs:
                   return body
 
               result = json.loads(body)
+
               if result.get("ok") is not True:
                   raise RuntimeError(
                       result.get("message", "Worker rejected request.")
                   )
+
               return result
 
           def summary(text):
@@ -121,39 +129,51 @@ jobs:
           job = call("/daily/start", "POST", b"")["job"]
 
           if job["state"] == "PUBLISHED" or job.get("published_id"):
-              summary("Today's Reel was already published. No duplicate sent.")
+              summary("Today's Reel is already published. No duplicate sent.")
               raise SystemExit(0)
 
           if job["state"] == "NEW":
-              print("Generating today's food image:", job["dish"])
-              image = call(
-                  "/daily/image",
-                  "POST",
-                  b"",
-                  binary=True
-              )
+              print("Generating today's image:", job["dish"])
+
+              image = call("/daily/image", "POST", b"", binary=True)
+
               with open("food.jpg", "wb") as output:
                   output.write(image)
 
+              # Provider lists these downloads as CC0/public domain.
+              # No public caption attribution is required.
+              # Source: https://script-timer.com/royalty-free-music/
               tracks = [
-                  {"title": "Carefree"},
-                  {"title": "Life of Riley"}
+                  {
+                      "title": "Happy Whistling Ukulele",
+                      "url": (
+                          "https://res.cloudinary.com/sw6kwtan/video/upload/"
+                          "fl_attachment%3Ahappy-whistling-ukulele/"
+                          "v1794178776/script-timer/free-music/"
+                          "happy-whistling-ukulele.mp3"
+                      )
+                  },
+                  {
+                      "title": "Ukulele Song",
+                      "url": (
+                          "https://res.cloudinary.com/sw6kwtan/video/upload/"
+                          "fl_attachment%3Aukulele-song/"
+                          "v1794178833/script-timer/free-music/"
+                          "ukulele-song.mp3"
+                      )
+                  }
               ]
-              random.SystemRandom().shuffle(tracks)
 
+              random.SystemRandom().shuffle(tracks)
               selected = None
 
               for track in tracks:
-                  filename = urllib.parse.quote(track["title"]) + ".mp3"
-                  address = (
-                      "https://incompetech.com/music/"
-                      "royalty-free/mp3-royaltyfree/" + filename
-                  )
                   try:
                       request = urllib.request.Request(
-                          address,
-                          headers={"User-Agent": "VantaBite-Automation/2.0"}
+                          track["url"],
+                          headers={"User-Agent": "VantaBite-Automation/3.0"}
                       )
+
                       with urllib.request.urlopen(
                           request, timeout=120
                       ) as response:
@@ -163,7 +183,7 @@ jobs:
                           len(music) < 10000 or
                           music.lstrip().startswith(b"<")
                       ):
-                          raise ValueError("Invalid audio download.")
+                          raise ValueError("Invalid music download.")
 
                       with open("music.mp3", "wb") as output:
                           output.write(music)
@@ -181,7 +201,9 @@ jobs:
                       print("Could not use:", track["title"])
 
               if selected is None:
-                  raise RuntimeError("No music available. Nothing published.")
+                  raise RuntimeError(
+                      "No music available. Nothing published."
+                  )
 
               filters = (
                   "[0:v]split=2[bg][fg];"
@@ -229,29 +251,26 @@ jobs:
               )["job"]
 
               summary(
-                  "Prepared " + job["dish"] +
-                  ' with music "' + selected["title"] + '".'
+                  "Fresh Reel prepared with a clean caption. "
+                  "Music selected automatically: " + selected["title"]
               )
 
           if job["state"] == "VIDEO_READY":
-              # Give public media storage time to propagate before Meta fetches it.
               time.sleep(65)
               job = call("/daily/prepare", "POST", b"")["job"]
 
           if not job.get("container_id"):
               raise RuntimeError(
-                  "Preparation outcome needs inspection. "
-                  "No automatic repeat or publish attempted."
+                  "Preparation needs inspection. No publish attempted."
               )
 
-          status = None
           for attempt in range(30):
               result = call("/daily/status")
               status = result["status"]
               print("Instagram processing:", status)
 
               if status == "PUBLISHED":
-                  summary("Instagram reports today's Reel is already published.")
+                  summary("Today's Reel is already published.")
                   raise SystemExit(0)
 
               if status == "FINISHED":
@@ -271,8 +290,8 @@ jobs:
 
           if not publish:
               summary(
-                  "Preview ready. Publishing was disabled for this manual run. "
-                  "Scheduled runs publish automatically."
+                  "Preview ready. Nothing published by this manual test. "
+                  "Scheduled runs publish automatically at or after 7 PM IST."
               )
               raise SystemExit(0)
 
@@ -291,7 +310,7 @@ jobs:
           current = datetime.datetime.now(IST)
 
           if current.date().isoformat() != day or current.hour >= 22:
-              raise RuntimeError("Publishing window ended. Nothing published.")
+              raise RuntimeError("Publishing window ended.")
 
           result = call("/daily/publish", "POST", b"")
 
