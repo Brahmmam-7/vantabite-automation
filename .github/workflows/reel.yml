@@ -2,9 +2,14 @@ name: VantaBite Daily Automation
 
 on:
   schedule:
-    # 13:17 UTC = 18:47 IST.
-    # Prepare first, then wait until 19:00 IST to publish.
+    # 18:47 IST: prepare, then wait until 19:00 IST.
     - cron: "17 13 * * *"
+
+    # Backup attempts at 19:07 and 19:27 IST.
+    - cron: "37,57 13 * * *"
+
+    # Final backup attempt at 19:47 IST.
+    - cron: "17 14 * * *"
 
   workflow_dispatch:
     inputs:
@@ -68,19 +73,22 @@ jobs:
           publish = os.environ.get("PUBLISH", "").lower() == "true"
           scheduled = os.environ["GITHUB_EVENT_NAME"] == "schedule"
 
+          with open(os.environ["GITHUB_EVENT_PATH"]) as source:
+              event = json.load(source)
+
           print("Current India time:", now.isoformat())
           print("Trigger:", os.environ["GITHUB_EVENT_NAME"])
-          print("Scheduled expression: 17 13 * * * UTC")
+          print("Schedule:", event.get("schedule", "Manual"))
           print("Publishing enabled:", publish)
 
           # Morning manual runs should be preview-only.
           if publish and not scheduled and now.hour < 18:
               raise SystemExit(
                   "Run a preview with Publish unchecked now. "
-                  "The scheduled run publishes this evening."
+                  "Scheduled runs publish this evening."
               )
 
-          # Prevent delayed scheduled jobs from posting overnight.
+          # Do not publish overnight if GitHub starts a run very late.
           if scheduled and (now.hour < 18 or now.hour >= 22):
               raise SystemExit(
                   "Outside today's publishing window. "
@@ -96,7 +104,7 @@ jobs:
           ):
               headers = {
                   "Authorization": "Bearer " + secret,
-                  "User-Agent": "VantaBite-Automation/3.1",
+                  "User-Agent": "VantaBite-Automation/3.2",
                   "Accept": "application/json"
               }
 
@@ -171,7 +179,7 @@ jobs:
           ):
               summary(
                   "Today's Reel is already published. "
-                  "No duplicate sent."
+                  "This run skipped publishing."
               )
               raise SystemExit(0)
 
@@ -227,7 +235,7 @@ jobs:
                           track["url"],
                           headers={
                               "User-Agent":
-                                  "VantaBite-Automation/3.1"
+                                  "VantaBite-Automation/3.2"
                           }
                       )
 
@@ -343,7 +351,7 @@ jobs:
               )
 
           if job["state"] == "VIDEO_READY":
-              # Allow the public video to propagate before Meta fetches it.
+              # Allow public video storage to propagate before Meta fetches it.
               time.sleep(65)
 
               job = call(
@@ -369,7 +377,8 @@ jobs:
 
               if status == "PUBLISHED":
                   summary(
-                      "Today's Reel is already published."
+                      "Instagram confirms today's Reel "
+                      "is already published. No duplicate sent."
                   )
                   raise SystemExit(0)
 
@@ -393,8 +402,7 @@ jobs:
           if not publish:
               summary(
                   "Preview ready. Nothing published by this "
-                  "manual test. Scheduled runs publish "
-                  "automatically at or after 7 PM IST."
+                  "manual test. Scheduled runs enable publishing."
               )
               raise SystemExit(0)
 
@@ -426,6 +434,8 @@ jobs:
                   "Publishing window ended."
               )
 
+          # Worker records a publishing attempt before contacting Meta.
+          # An uncertain publishing result is not blindly retried.
           result = call(
               "/daily/publish",
               "POST",
