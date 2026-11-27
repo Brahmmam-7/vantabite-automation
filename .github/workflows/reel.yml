@@ -94,3 +94,364 @@ jobs:
               )
 
           def call(
+              route,
+              method="GET",
+              data=None,
+              extra=None,
+              binary=False
+          ):
+              headers = {
+                  "Authorization": "Bearer " + secret,
+                  "User-Agent": "VantaBite-Automation/3.2",
+                  "Accept": "application/json"
+              }
+
+              if extra:
+                  headers.update(extra)
+
+              request = urllib.request.Request(
+                  base + route + "?day=" + day,
+                  data=data,
+                  method=method,
+                  headers=headers
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      request,
+                      timeout=240
+                  ) as response:
+                      body = response.read()
+
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode(
+                      "utf-8",
+                      errors="replace"
+                  )
+                  detail = detail.replace(secret, "[hidden]")
+
+                  raise RuntimeError(
+                      f"{route}: HTTP {error.code}: "
+                      f"{detail[:1500]}"
+                  )
+
+              except urllib.error.URLError:
+                  raise RuntimeError(
+                      route +
+                      ": connection failed. Mutation not retried."
+                  )
+
+              if binary:
+                  return body
+
+              result = json.loads(body)
+
+              if result.get("ok") is not True:
+                  raise RuntimeError(
+                      result.get(
+                          "message",
+                          "Worker rejected request."
+                      )
+                  )
+
+              return result
+
+          def summary(text):
+              print(text)
+
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a"
+              ) as output:
+                  output.write(text + "\n\n")
+
+          job = call(
+              "/daily/start",
+              "POST",
+              b""
+          )["job"]
+
+          if (
+              job["state"] == "PUBLISHED" or
+              job.get("published_id")
+          ):
+              summary(
+                  "Today's Reel is already published. "
+                  "This run skipped publishing."
+              )
+              raise SystemExit(0)
+
+          if job["state"] == "NEW":
+              print(
+                  "Generating today's image:",
+                  job["dish"]
+              )
+
+              image = call(
+                  "/daily/image",
+                  "POST",
+                  b"",
+                  binary=True
+              )
+
+              with open("food.jpg", "wb") as output:
+                  output.write(image)
+
+              # Provider lists these tracks as CC0/public domain.
+              # No music credit is added to the public caption.
+              # Source:
+              # https://script-timer.com/royalty-free-music/
+              tracks = [
+                  {
+                      "title": "Happy Whistling Ukulele",
+                      "url": (
+                          "https://res.cloudinary.com/"
+                          "sw6kwtan/video/upload/"
+                          "fl_attachment%3Ahappy-whistling-ukulele/"
+                          "v1794178776/script-timer/free-music/"
+                          "happy-whistling-ukulele.mp3"
+                      )
+                  },
+                  {
+                      "title": "Ukulele Song",
+                      "url": (
+                          "https://res.cloudinary.com/"
+                          "sw6kwtan/video/upload/"
+                          "fl_attachment%3Aukulele-song/"
+                          "v1794178833/script-timer/free-music/"
+                          "ukulele-song.mp3"
+                      )
+                  }
+              ]
+
+              random.SystemRandom().shuffle(tracks)
+              selected = None
+
+              for track in tracks:
+                  try:
+                      request = urllib.request.Request(
+                          track["url"],
+                          headers={
+                              "User-Agent":
+                                  "VantaBite-Automation/3.2"
+                          }
+                      )
+
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=120
+                      ) as response:
+                          music = response.read()
+
+                      if (
+                          len(music) < 10000 or
+                          music.lstrip().startswith(b"<")
+                      ):
+                          raise ValueError(
+                              "Invalid music download."
+                          )
+
+                      with open("music.mp3", "wb") as output:
+                          output.write(music)
+
+                      subprocess.run([
+                          "ffmpeg",
+                          "-hide_banner",
+                          "-loglevel", "error",
+                          "-xerror",
+                          "-i", "music.mp3",
+                          "-t", "12",
+                          "-f", "null",
+                          "-"
+                      ], check=True)
+
+                      selected = track
+                      break
+
+                  except Exception:
+                      print(
+                          "Could not use:",
+                          track["title"]
+                      )
+
+              if selected is None:
+                  raise RuntimeError(
+                      "No music available. Nothing published."
+                  )
+
+              filters = (
+                  "[0:v]split=2[bg][fg];"
+                  "[bg]scale=1080:1920:"
+                  "force_original_aspect_ratio=increase,"
+                  "crop=1080:1920,setsar=1,"
+                  "boxblur=40:2[background];"
+                  "[fg]scale=1080:1920:"
+                  "force_original_aspect_ratio=decrease,"
+                  "setsar=1[foreground];"
+                  "[background][foreground]"
+                  "overlay=(W-w)/2:(H-h)/2,"
+                  "format=yuv420p[v];"
+                  "[1:a]atrim=duration=12,"
+                  "asetpts=PTS-STARTPTS,"
+                  "volume=0.65,"
+                  "afade=t=in:st=0:d=0.5,"
+                  "afade=t=out:st=10.5:d=1.5[a]"
+              )
+
+              subprocess.run([
+                  "ffmpeg",
+                  "-hide_banner",
+                  "-loglevel", "error",
+                  "-y",
+                  "-loop", "1",
+                  "-framerate", "30",
+                  "-i", "food.jpg",
+                  "-i", "music.mp3",
+                  "-filter_complex", filters,
+                  "-map", "[v]",
+                  "-map", "[a]",
+                  "-t", "12",
+                  "-r", "30",
+                  "-c:v", "libx264",
+                  "-preset", "fast",
+                  "-crf", "23",
+                  "-pix_fmt", "yuv420p",
+                  "-c:a", "aac",
+                  "-b:a", "128k",
+                  "-ar", "48000",
+                  "-ac", "2",
+                  "-movflags", "+faststart",
+                  "reel.mp4"
+              ], check=True)
+
+              with open("reel.mp4", "rb") as source:
+                  video = source.read()
+
+              if len(video) > 20 * 1024 * 1024:
+                  raise RuntimeError(
+                      "Video exceeds 20 MB."
+                  )
+
+              job = call(
+                  "/daily/video",
+                  "POST",
+                  video,
+                  {
+                      "Content-Type": "video/mp4",
+                      "X-Music-Title": selected["title"]
+                  }
+              )["job"]
+
+              summary(
+                  "Fresh Reel prepared with a clean caption. "
+                  "Music selected automatically: " +
+                  selected["title"]
+              )
+
+          if job["state"] == "VIDEO_READY":
+              # Allow public video storage to propagate before Meta fetches it.
+              time.sleep(65)
+
+              job = call(
+                  "/daily/prepare",
+                  "POST",
+                  b""
+              )["job"]
+
+          if not job.get("container_id"):
+              raise RuntimeError(
+                  "Preparation needs inspection. "
+                  "No publish attempted."
+              )
+
+          for attempt in range(30):
+              result = call("/daily/status")
+              status = result["status"]
+
+              print(
+                  "Instagram processing:",
+                  status
+              )
+
+              if status == "PUBLISHED":
+                  summary(
+                      "Instagram confirms today's Reel "
+                      "is already published. No duplicate sent."
+                  )
+                  raise SystemExit(0)
+
+              if status == "FINISHED":
+                  break
+
+              if status in ("ERROR", "EXPIRED"):
+                  raise RuntimeError(
+                      "Instagram processing failed: " +
+                      result.get("details", status)
+                  )
+
+              time.sleep(20)
+
+          else:
+              raise RuntimeError(
+                  "Instagram processing did not finish "
+                  "within 10 minutes."
+              )
+
+          if not publish:
+              summary(
+                  "Preview ready. Nothing published by this "
+                  "manual test. The Cloudflare scheduler enables publishing."
+              )
+              raise SystemExit(0)
+
+          target = datetime.datetime.combine(
+              datetime.date.fromisoformat(day),
+              datetime.time(19, 0),
+              tzinfo=IST
+          )
+
+          if test_mode:
+              target = datetime.datetime.now(IST)
+              print("Temporary test: publishing as soon as processing finishes.")
+
+          if datetime.datetime.now(IST) < target:
+              print("Reel ready. Waiting until 7 PM IST.")
+
+          while datetime.datetime.now(IST) < target:
+              remaining = (
+                  target - datetime.datetime.now(IST)
+              ).total_seconds()
+
+              time.sleep(
+                  min(30, max(0, remaining))
+              )
+
+          current = datetime.datetime.now(IST)
+
+          if (
+              current.date().isoformat() != day or
+              (not test_mode and current.hour >= 22)
+          ):
+              raise RuntimeError(
+                  "Publishing window ended."
+              )
+
+          # Worker records a publishing attempt before contacting Meta.
+          # An uncertain publishing result is not blindly retried.
+          result = call(
+              "/daily/publish",
+              "POST",
+              b""
+          )
+
+          summary(
+              "Today's Reel published or confirmed "
+              "already published. Media ID: " +
+              str(
+                  result.get(
+                      "publishedId",
+                      "see Instagram"
+                  )
+              )
+          )
+          PY
